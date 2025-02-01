@@ -7,7 +7,7 @@ from collections import defaultdict, namedtuple
 from pathlib import Path
 import networkx as nx
 from tree_sitter import Language, Parser
-from utils import create_structure
+from repograph.utils import create_structure
 import pickle
 import json
 
