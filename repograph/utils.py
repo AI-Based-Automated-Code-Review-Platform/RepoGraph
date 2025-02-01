@@ -1,17 +1,19 @@
 import os
 from tree_sitter import Language, Parser
 
-# Load the tree-sitter Python, JavaScript, and Java parsers
+# Load the tree-sitter Python, JavaScript, Java, and C parsers
 PY_LANGUAGE = Language("build/my-languages.so", "python")
 JS_LANGUAGE = Language("build/my-languages.so", "javascript")
 JAVA_LANGUAGE = Language("build/my-languages.so", "java")
+C_LANGUAGE = Language("build/my-languages.so", "c")
 
 parser = Parser()
 
 LANGUAGE_MAP = {
     ".py": PY_LANGUAGE,
     ".js": JS_LANGUAGE,
-    ".java": JAVA_LANGUAGE
+    ".java": JAVA_LANGUAGE,
+    ".c": C_LANGUAGE,
 }
 
 def set_language_for_file(file_extension):
@@ -22,9 +24,9 @@ def set_language_for_file(file_extension):
         raise ValueError(f"Unsupported file extension: {file_extension}")
 
 def create_structure(directory_path):
-    """Create the structure of the repository directory by parsing Python, JavaScript, and Java files.
-    :param directory_path: Path to the repository directory.
-    :return: A dictionary representing the structure.
+    """
+    Create a nested dictionary structure representing the repository.
+    This function is optional and used by CodeGraph to gather top-level info.
     """
     structure = {}
 
@@ -32,31 +34,85 @@ def create_structure(directory_path):
         relative_root = os.path.relpath(root, directory_path)
         curr_struct = structure
 
-        # Handle the root directory case
+        # At the top-level directory
         if relative_root == ".":
             for file_name in files:
                 file_extension = os.path.splitext(file_name)[1]
                 if file_extension in LANGUAGE_MAP:
                     file_path = os.path.join(root, file_name)
                     file_info = parse_file(file_path, file_extension)
-                    structure[file_name] = file_info
+                    try:
+                        size = os.path.getsize(file_path)
+                        created_at = os.path.getctime(file_path)
+                        updated_at = os.path.getmtime(file_path)
+                    except Exception as e:
+                        print(f"Error getting metadata for {file_path}: {e}")
+                        size = 0
+                        created_at = 0
+                        updated_at = 0
+
+                    structure[file_name] = {
+                        "file_info": file_info,
+                        "metadata": {
+                            "type": "file",
+                            "path": os.path.relpath(file_path, directory_path),
+                            "name": file_name,
+                            "range": [1, 1],
+                            "metadata": {
+                                "size": size,
+                                "language": file_extension[1:],
+                                "created_at": created_at,
+                                "updated_at": updated_at,
+                                "dependencies": []
+                            }
+                        }
+                    }
+            # Proceed to the next iteration for subdirectories
             continue
 
+        # Build a nested structure for subdirectories
         for part in relative_root.split(os.sep):
             if part not in curr_struct:
                 curr_struct[part] = {}
             curr_struct = curr_struct[part]
 
+        # Handle files in subdirectories
         for file_name in files:
             file_extension = os.path.splitext(file_name)[1]
             if file_extension in LANGUAGE_MAP:
                 file_path = os.path.join(root, file_name)
                 file_info = parse_file(file_path, file_extension)
-                curr_struct[file_name] = file_info
+                try:
+                    size = os.path.getsize(file_path)
+                    created_at = os.path.getctime(file_path)
+                    updated_at = os.path.getmtime(file_path)
+                except Exception as e:
+                    print(f"Error getting metadata for {file_path}: {e}")
+                    size = 0
+                    created_at = 0
+                    updated_at = 0
+
+
+                curr_struct[file_name] = {
+                    "file_info": file_info,
+                    "metadata": {
+                        "type": "file",
+                        "path": os.path.relpath(file_path, directory_path),
+                        "name": file_name,
+                        "range": [1, 1],
+                        "metadata": {
+                            "size": size,
+                            "language": file_extension[1:],
+                            "created_at": created_at,
+                            "updated_at": updated_at,
+                            "dependencies": []
+                        }
+                    }
+                }
             else:
                 curr_struct[file_name] = {}
 
-        # Handle empty directories
+        # If there are empty dirs, we simply keep them in the structure
         for dir_name in dirs:
             if dir_name not in curr_struct:
                 curr_struct[dir_name] = {}
@@ -64,9 +120,9 @@ def create_structure(directory_path):
     return structure
 
 def parse_file(file_path, file_extension):
-    """Parse a file to extract class and function definitions with their line numbers."""
+    """Parse a file to extract high-level definitions (classes, functions)."""
     try:
-        with open(file_path, "r") as file:
+        with open(file_path, "r", encoding="utf-8") as file:
             file_content = file.read()
     except Exception as e:
         print(f"Error reading file {file_path}: {e}")
@@ -82,6 +138,8 @@ def parse_file(file_path, file_extension):
         return parse_javascript_like_file(root_node)
     elif file_extension == ".java":
         return parse_java_like_file(root_node)
+    elif file_extension == ".c":
+        return parse_c_file(root_node)
 
     return {}
 
@@ -96,6 +154,10 @@ def parse_javascript_like_file(root_node):
 def parse_java_like_file(root_node):
     """Parse Java-like files for classes and methods."""
     return extract_definitions(root_node, ["class_declaration", "method_declaration"])
+
+def parse_c_file(root_node):
+    """Parse C files for function definitions."""
+    return extract_definitions(root_node, ["function_definition"])
 
 def extract_definitions(node, definition_types):
     """Extract class and function/method definitions from the syntax tree."""
@@ -113,7 +175,7 @@ def extract_definitions(node, definition_types):
                     "name": name,
                     "start_line": start_line,
                     "end_line": end_line,
-                    "methods": extract_definitions(child, ["method_definition", "method_declaration"]),
+                    "methods": extract_definitions(child, ["method_definition", "method_declaration"])["functions"],
                 })
             elif child.type in ["function", "function_definition", "method_declaration"]:
                 functions.append({
@@ -123,8 +185,8 @@ def extract_definitions(node, definition_types):
                 })
 
         extracted = extract_definitions(child, definition_types)
-        classes.extend(extracted["classes"])
-        functions.extend(extracted["functions"])
+        classes.extend(extracted.get("classes", []))
+        functions.extend(extracted.get("functions", []))
 
     return {
         "classes": classes,
