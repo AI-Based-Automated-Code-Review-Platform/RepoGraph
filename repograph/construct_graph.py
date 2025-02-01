@@ -70,10 +70,21 @@ class CodeGraph:
         self.all_source_files = self.find_src_files(self.root)
 
     def parse_tree(self, code, file_extension):
-        """Parse the code using tree-sitter."""
+        """Parse the code (string) using tree-sitter."""
         set_language_for_file(file_extension)
         tree = parser.parse(bytes(code, "utf-8"))
         return tree
+
+    def parse_code_string(self, code_string, rel_fname):
+        """
+        Parse the given code string in-memory using tree-sitter
+        and return the extracted tags (like classes, functions, imports, etc.).
+        """
+        file_extension = os.path.splitext(rel_fname)[1]
+        tree = self.parse_tree(code_string, file_extension)
+        def_tags = self.extract_tags(tree.root_node, rel_fname)
+        import_tags = self.extract_imports(tree.root_node, file_extension, rel_fname)
+        return def_tags + import_tags
 
     def extract_function_calls(self, node, rel_fname, current_function):
         """
@@ -99,13 +110,13 @@ class CodeGraph:
             calls.extend(self.extract_function_calls(child, rel_fname, current_function))
         return calls
 
+
     def extract_variable_attributes(self, node, rel_fname, current_function, inside_assignment=False):
         """
         Recursively walk the AST to find variable/attribute references inside a function.
         We'll store 'fname=current_function' so 'fname' reflects the enclosing function name.
         """
         dependencies = []
-
 
         if node.type in ("assignment", "augmented_assignment_expression"):
             # Typically child[0] => left side (writes), child[-1] => right side (reads)
@@ -267,12 +278,10 @@ class CodeGraph:
 
                     # Recursively gather method definitions inside the class
                     methods = self.extract_tags(child, rel_fname)
-                    # We'll mark them as "method" for clarity, but also keep them as "function" category
+                    # Mark them as "method" (but also keep them as "function" category)
                     for method in methods:
                         if method.category == "function":
-                            method_info = {
-                                "name": method.name
-                            }
+                            method_info = {"name": method.name}
                             tags.append(Tag(
                                 rel_fname=rel_fname,
                                 fname=None,
@@ -354,9 +363,9 @@ class CodeGraph:
                             line=[child.start_point[0] + 1, child.end_point[0] + 1],
                             name=imported_mod,
                             kind="import",
-
                             category="import",
                             info={}
+
                         )
                     )
 
@@ -366,7 +375,7 @@ class CodeGraph:
         return imports
 
     def get_tags(self, fname, rel_fname):
-        """Get tags for a given file using tree-sitter."""
+        """Get tags for a given file by reading it from disk and parsing."""
         try:
             with open(fname, "r", encoding="utf-8") as f:
                 code = f.read()
@@ -379,11 +388,10 @@ class CodeGraph:
 
         def_tags = self.extract_tags(tree.root_node, rel_fname)
         import_tags = self.extract_imports(tree.root_node, file_extension, rel_fname)
-
         return def_tags + import_tags
 
     def get_code_graph(self, other_files, mentioned_fnames=None):
-        """Build a code graph from extracted tags."""
+        """Build a code graph from extracted tags for the given list of file paths."""
         if self.max_map_tokens <= 0 or not other_files:
             return None, None
         if not mentioned_fnames:
@@ -458,7 +466,7 @@ class CodeGraph:
             node_data = {
                 "relative_path": f,
                 "file_name": file_name,
-                "name": file_name,              
+                "name": file_name,
                 "type": "file",
                 "line_range": [1, total_lines if total_lines else 1],
                 "metadata": {
@@ -479,10 +487,8 @@ class CodeGraph:
                 continue
 
             node_key = self._get_node_key(tag)
-            # Some ephemeral tags (inherits, call, etc.) we might not want as real nodes
-            # We'll decide below.
+            # Some ephemeral tags (inherits, call, etc.) might only be edges
             if tag.kind in ["inherits", "call"]:
-                # We'll handle as edges, skip making a node
                 continue
 
             if not G.has_node(node_key):
@@ -492,8 +498,7 @@ class CodeGraph:
                 elif tag.kind in ["def", "method"] and tag.category == "function":
                     node_type = "function"
                 elif tag.kind == "import":
-                    # We do not want a separate "import" node type per your 4 node types.
-                    # We'll skip adding it as a node. We'll only add file->file edges below.
+                    # We'll only add file->file edges for imports
                     continue
                 elif tag.kind in ["write", "read"]:
                     node_type = "variable"
@@ -521,9 +526,9 @@ class CodeGraph:
                     }
                 elif node_type == "function":
                     node_data["metadata"] = {
-                        "parameters": [],      
-                        "parent_class": None,  
-                        "calls": [],           
+                        "parameters": [],
+                        "parent_class": None,
+                        "calls": [],
                         "reads": [],
                         "writes": [],
                     }
@@ -553,11 +558,12 @@ class CodeGraph:
                 # Check method tags that lie within the class range
                 for possible_method in tags:
                     if possible_method.kind == 'method' and possible_method.rel_fname == tag.rel_fname:
+                        # If method lines are inside the class lines
                         if (possible_method.line[0] >= tag.line[0]) and (possible_method.line[1] <= tag.line[1]):
                             method_key = self._get_node_key(possible_method)
                             if G.has_node(class_key) and G.has_node(method_key):
                                 G.add_edge(class_key, method_key, label='contains')
-                                # Also record in method's metadata
+                                # Also record parent_class in method's metadata
                                 G.nodes[method_key]["metadata"]["parent_class"] = tag.name
 
         # 5) file->file edges from imports
@@ -575,13 +581,11 @@ class CodeGraph:
                     match = re.search(r'#include\s+"([^"]+)"', imported_module_string)
                     if match:
                         local_header_basename = os.path.splitext(match.group(1))[0]
-                        # Attempt to find a file node with that name
                         for f in G.nodes:
                             if G.nodes[f].get('type') == 'file':
                                 base = os.path.splitext(os.path.basename(f))[0]
                                 if base == local_header_basename:
                                     G.add_edge(importing_file_node, f, label='imports')
-                                    # Record dependency
                                     G.nodes[importing_file_node]["metadata"]["dependencies"].append(f)
                 else:
                     # Python/JS/Java
@@ -611,7 +615,7 @@ class CodeGraph:
                 callee_node_key = self._get_func_node_key(tag.rel_fname, callee)
 
 
-                # Ensure we have nodes
+                # Ensure we have a node for caller
                 if not G.has_node(caller_node_key):
                     G.add_node(
                         caller_node_key,
@@ -628,6 +632,7 @@ class CodeGraph:
                             "writes": [],
                         }
                     )
+                # Ensure we have a node for callee
                 if not G.has_node(callee_node_key):
                     G.add_node(
                         callee_node_key,
@@ -662,29 +667,33 @@ class CodeGraph:
                 parent_key = self._get_class_node_key(tag.rel_fname, parent_cls)
 
                 if not G.has_node(child_key):
-                    G.add_node(child_key,
-                               relative_path=tag.rel_fname,
-                               file_name=os.path.basename(tag.rel_fname),
-                               name=child_cls,
-                               type="class",
-                               line_range=[tag.line[0], tag.line[1]],
-                               metadata={
-                                   "parent_classes": [],
-                                   "methods": [],
-                                   "variables": [],
-                               })
+                    G.add_node(
+                        child_key,
+                        relative_path=tag.rel_fname,
+                        file_name=os.path.basename(tag.rel_fname),
+                        name=child_cls,
+                        type="class",
+                        line_range=[tag.line[0], tag.line[1]],
+                        metadata={
+                            "parent_classes": [],
+                            "methods": [],
+                            "variables": [],
+                        }
+                    )
                 if not G.has_node(parent_key):
-                    G.add_node(parent_key,
-                               relative_path=tag.rel_fname,
-                               file_name=os.path.basename(tag.rel_fname),
-                               name=parent_cls,
-                               type="class",
-                               line_range=[tag.line[0], tag.line[1]],
-                               metadata={
-                                   "parent_classes": [],
-                                   "methods": [],
-                                   "variables": [],
-                               })
+                    G.add_node(
+                        parent_key,
+                        relative_path=tag.rel_fname,
+                        file_name=os.path.basename(tag.rel_fname),
+                        name=parent_cls,
+                        type="class",
+                        line_range=[tag.line[0], tag.line[1]],
+                        metadata={
+                            "parent_classes": [],
+                            "methods": [],
+                            "variables": [],
+                        }
+                    )
 
                 G.add_edge(child_key, parent_key, label='inherits_from')
                 G.nodes[child_key]["metadata"]["parent_classes"].append(parent_key)
@@ -758,11 +767,9 @@ class CodeGraph:
         if tag.kind == "def" and tag.category == "class":
             return f"{tag.rel_fname}::class::{tag.name}"
         if tag.kind in ["def", "method"] and tag.category == "function":
-            # Use same key approach for function
             return self._get_func_node_key(tag.rel_fname, tag.name)
         if tag.kind in ["read", "write"]:
             return self._get_var_node_key(tag.rel_fname, tag.name)
-        # "import" we skip or handle differently
         return f"{tag.rel_fname}::{tag.category}::{tag.name}"
 
     def _get_func_node_key(self, rel_fname, func_name):
@@ -793,7 +800,6 @@ class CodeGraph:
         if not os.path.isdir(directory):
             return [directory]
 
-
         src_files = []
         for root_dir, dirs, files in os.walk(directory):
             for file in files:
@@ -801,7 +807,9 @@ class CodeGraph:
                     src_files.append(os.path.join(root_dir, file))
         return src_files
 
+
     def find_files(self, dirs):
+        """Given a list of paths or directories, return all valid source file paths."""
         chat_fnames = []
         for dir in dirs:
             p = Path(dir)
@@ -811,8 +819,12 @@ class CodeGraph:
                 chat_fnames.append(dir)
         return chat_fnames
 
-
 if __name__ == "__main__":
+    # If run directly, we parse a local directory path from sys.argv
+    if len(sys.argv) < 2:
+        print("Usage: python construct_graph.py <directory_path>")
+        sys.exit(1)
+
     dir_name = sys.argv[1]
     code_graph = CodeGraph(root=dir_name)
     all_src_files = code_graph.find_files([dir_name])
@@ -828,7 +840,19 @@ if __name__ == "__main__":
     print(f"   Number of edges: {len(G.edges)}")
     print("---------------------------------")
 
-    # Now produce the final metadata JSON according to your specification
+    # **Step 1: Cache File Contents**
+    # To improve efficiency, cache the lines of each file.
+    file_contents_cache = {}
+    for file_path in all_src_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                file_contents_cache[file_path] = lines
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            file_contents_cache[file_path] = []
+
+    # Now produce the final metadata JSON
     final_nodes = []
     for node_id in G.nodes:
         data = G.nodes[node_id]
@@ -842,95 +866,173 @@ if __name__ == "__main__":
             "filepath": data["relative_path"],
             "start_line": data["line_range"][0],
             "end_line": data["line_range"][1],
-            "Info": {}
+            "Info": {
+                "Number_of_line": data["metadata"].get("total_lines", 0),
+                "Language": data["metadata"].get("language", ""),
+                "relatedfiles": []
+            }
         }
 
-        # if node_type == "file":
-        #     # Info:
-        #     #  - Number_of_line
-        #     #  - Language
-        #     out["Info"] = {
-        #         "Number_of_line": data["metadata"]["total_lines"],
-        #         "Language": data["metadata"]["language"]
-        #     }
+        # **Step 2: Extract Related Files**
         if node_type == "file":
-            dep_ids = data["metadata"]["dependencies"]  # node IDs
+            dep_ids = data["metadata"].get("dependencies", [])  # node IDs
             related_files = []
             for dep_id in dep_ids:
                 if dep_id in G.nodes:
                     related_files.append(G.nodes[dep_id]["name"])
-                    
-            out["Info"] = {
-                "Number_of_line": data["metadata"]["total_lines"],
-                "Language": data["metadata"]["language"],
-                "relatedfiles": related_files
-            }
+            out["Info"]["relatedfiles"] = related_files
 
         elif node_type == "class":
-            # Info:
-            #  - Inheritance
-            #  - methods
-            #  - variables
             meta = data["metadata"]
-            # parent_classes is a list of node-ids for the parents
             parent_names = []
-            for parent_id in meta["parent_classes"]:
+            for parent_id in meta.get("parent_classes", []):
                 if parent_id in G.nodes:
                     parent_names.append(G.nodes[parent_id]["name"])
 
-            # methods can be found by looking for edges class->function, or check metadata["methods"] if you populate it
-            # We'll gather from the graph edges
+            # Gather methods by checking edges or metadata
             method_names = []
             for succ in G.successors(node_id):
                 if G.nodes[succ]["type"] == "function":
-                    # It's a method if the function's parent_class matches this class name
-                    if G.nodes[succ]["metadata"]["parent_class"] == data["name"]:
+                    # It's a method if the parent_class is this class name
+                    if G.nodes[succ]["metadata"].get("parent_class") == data["name"]:
                         method_names.append(G.nodes[succ]["name"])
 
-            # variables: for a purely "class-level" variable, we haven't been extracting them separately,
-            # but we can approximate by collecting all variables used in the methods of this class:
-            var_names = list(set(meta["variables"]))  # if you ever add them
-            # Or optionally gather from each method's reads/writes (but that might be too broad).
-            # We'll leave the code to store them if you adapt the extraction logic.
+            var_names = list(set(meta.get("variables", [])))  # Adapt if you store class-level vars
 
-
-            out["Info"] = {
-                "Inheritance": parent_names,  # List of parent class names
+            out["Info"].update({
+                "Inheritance": parent_names,
                 "methods": method_names,
                 "variables": var_names
-            }
+            })
 
         elif node_type == "function":
-            # Info:
-            #  - Parameter
-            #  - IsMethodof
-            #  - calls
             meta = data["metadata"]
-            # calls is a list of function node-ids
             call_names = []
-            for callee_id in meta["calls"]:
+            for callee_id in meta.get("calls", []):
                 if callee_id in G.nodes:
                     call_names.append(G.nodes[callee_id]["name"])
 
-            out["Info"] = {
-                "Parameter": meta.get("parameters", []),
-                "IsMethodof": meta["parent_class"],
-                "calls": call_names
+
+    def find_files(self, dirs):
+        """Given a list of paths or directories, return all valid source file paths."""
+        chat_fnames = []
+        for dir in dirs:
+            p = Path(dir)
+            if p.is_dir():
+                chat_fnames += self.find_src_files(dir)
+            elif os.path.splitext(dir)[1] in LANGUAGE_MAP.keys():
+                chat_fnames.append(dir)
+        return chat_fnames
+
+if __name__ == "__main__":
+    # If run directly, we parse a local directory path from sys.argv
+    if len(sys.argv) < 2:
+        print("Usage: python construct_graph.py <directory_path>")
+        sys.exit(1)
+
+    dir_name = sys.argv[1]
+    code_graph = CodeGraph(root=dir_name)
+    all_src_files = code_graph.find_files([dir_name])
+    tags, G = code_graph.get_code_graph(all_src_files)
+
+    if G is None:
+        print("No graph constructed (possibly no valid source files).")
+        sys.exit(0)
+
+    print("---------------------------------")
+    print(f"Successfully constructed the code graph for repo directory {dir_name}")
+    print(f"   Number of nodes: {len(G.nodes)}")
+    print(f"   Number of edges: {len(G.edges)}")
+    print("---------------------------------")
+
+    # **Step 1: Cache File Contents**
+    # To improve efficiency, cache the lines of each file.
+    file_contents_cache = {}
+    for file_path in all_src_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                file_contents_cache[file_path] = lines
+        except Exception as e:
+            print(f"Error reading file {file_path}: {e}")
+            file_contents_cache[file_path] = []
+
+    # Now produce the final metadata JSON
+    final_nodes = []
+    for node_id in G.nodes:
+        data = G.nodes[node_id]
+        node_type = data["type"]
+
+        # Common fields
+        out = {
+            "Node_id": node_id,
+            "Node_type": node_type,
+            "name": data["name"],
+            "filepath": data["relative_path"],
+            "start_line": data["line_range"][0],
+            "end_line": data["line_range"][1],
+            "Info": {
+                "Number_of_line": data["metadata"].get("total_lines", 0),
+                "Language": data["metadata"].get("language", ""),
+                "relatedfiles": []
             }
+        }
+
+        # **Step 2: Extract Related Files**
+        if node_type == "file":
+            dep_ids = data["metadata"].get("dependencies", [])  # node IDs
+            related_files = []
+            for dep_id in dep_ids:
+                if dep_id in G.nodes:
+                    related_files.append(G.nodes[dep_id]["name"])
+            out["Info"]["relatedfiles"] = related_files
+
+        elif node_type == "class":
+            meta = data["metadata"]
+            parent_names = []
+            for parent_id in meta.get("parent_classes", []):
+                if parent_id in G.nodes:
+                    parent_names.append(G.nodes[parent_id]["name"])
+
+            # Gather methods by checking edges or metadata
+            method_names = []
+            for succ in G.successors(node_id):
+                if G.nodes[succ]["type"] == "function":
+                    # It's a method if the parent_class is this class name
+                    if G.nodes[succ]["metadata"].get("parent_class") == data["name"]:
+                        method_names.append(G.nodes[succ]["name"])
+
+            var_names = list(set(meta.get("variables", [])))  # Adapt if you store class-level vars
+
+            out["Info"].update({
+                "Inheritance": parent_names,
+                "methods": method_names,
+                "variables": var_names
+            })
+
+        elif node_type == "function":
+            meta = data["metadata"]
+            call_names = []
+            for callee_id in meta.get("calls", []):
+                if callee_id in G.nodes:
+                    call_names.append(G.nodes[callee_id]["name"])
+
+
+            out["Info"].update({
+                "Parameter": meta.get("parameters", []),
+                "IsMethodof": meta.get("parent_class"),
+                "calls": call_names
+            })
 
         elif node_type == "variable":
-            # Info:
-            #  - calls (list function and classes that use this global variable)
             meta = data["metadata"]
-            used_by = set(meta["accessed_by"] + meta["modified_by"])
-            # We want names of functions or classes that use this var
+            used_by = set(meta.get("accessed_by", []) + meta.get("modified_by", []))
             calls = []
             for used_id in used_by:
                 if used_id in G.nodes:
                     used_node = G.nodes[used_id]
                     if used_node["type"] == "function":
                         func_name = used_node["name"]
-                        # If that function is a method of a class, we might also include the class name:
                         parent_cls = used_node["metadata"].get("parent_class", None)
                         if parent_cls:
                             calls.append(parent_cls)
@@ -938,20 +1040,31 @@ if __name__ == "__main__":
                     elif used_node["type"] == "class":
                         calls.append(used_node["name"])
                     else:
-                        # Potentially a file or unknown type
                         calls.append(used_node["name"])
-            out["Info"] = {
-                "calls": list(set(calls))
-            }
+            out["Info"].update({"calls": list(set(calls))})
+
+        # **Step 3: Extract Code Snippet**
+        # Only add code snippets for node types other than "file" and "class"
+        if node_type not in ["file", "class"]:
+            file_path = os.path.join(code_graph.root, data["relative_path"])
+            lines = file_contents_cache.get(file_path, [])
+            start = max(data["line_range"][0] - 1, 0)  # Convert to 0-based index
+            end = data["line_range"][1]  # Exclusive in slicing
+            # Ensure end does not exceed the number of lines
+            end = min(end, len(lines))
+            code_snippet = ''.join(lines[start:end]).strip()
+            out["Info"]["code"] = code_snippet
 
         final_nodes.append(out)
 
     # Write out as one JSON array
-    with open(f"{os.getcwd()}/tags.json", "w", encoding="utf-8") as f:
+    tags_json_path = os.path.join(os.getcwd(), "tags.json")
+    with open(tags_json_path, "w", encoding="utf-8") as f:
         json.dump(final_nodes, f, indent=2)
 
     # Also cache the graph if needed
-    with open(f'{os.getcwd()}/graph.pkl', 'wb') as f:
+    graph_pkl_path = os.path.join(os.getcwd(), "graph.pkl")
+    with open(graph_pkl_path, 'wb') as f:
         pickle.dump(G, f)
 
-    print(f"Successfully wrote updated metadata to {os.getcwd()}/tags.json")
+    print(f"Successfully wrote updated metadata to {tags_json_path}")
