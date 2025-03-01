@@ -83,8 +83,9 @@ class CodeGraph:
         file_extension = os.path.splitext(rel_fname)[1]
         tree = self.parse_tree(code_string, file_extension)
         def_tags = self.extract_tags(tree.root_node, rel_fname)
+        global_tags = self.extract_global_tags(tree.root_node, rel_fname)
         import_tags = self.extract_imports(tree.root_node, file_extension, rel_fname)
-        return def_tags + import_tags
+        return def_tags + global_tags + import_tags
 
     def extract_function_calls(self, node, rel_fname, current_function):
         """
@@ -113,13 +114,90 @@ class CodeGraph:
 
     def extract_variable_attributes(self, node, rel_fname, current_function, inside_assignment=False):
         """
-        Recursively walk the AST to find variable/attribute references inside a function.
-        We'll store 'fname=current_function' so 'fname' reflects the enclosing function name.
+        Recursively extract variable and attribute usages from a function body,
+        while ignoring type annotations and treating qualified names (e.g. obj.field)
+        as one variable.
+        
+        For parameters (typed_parameter) we capture the var_type in info.
+        We also avoid adding the function's own name by skipping identifiers that
+        belong directly to the function_definition header.
         """
         dependencies = []
+        
+        # Skip or specially handle type annotation nodes.
+        if node.type in ("typed_parameter", "typed_default_parameter", "parameter", "default_parameter"):
+            param_name_node = node.children[0]
+            var_type = ""
+            if node.type == "typed_parameter" or node.type == "typed_default_parameter"  and node.children:
+                if len(node.children) > 2 and node.children[2].type == "type":
+                    type_node = node.children[2]
+                    var_type = type_node.text.decode("utf-8")
+            if param_name_node.type == "identifier":
+                var_name = param_name_node.text.decode("utf-8")
+                kind = "write" if inside_assignment else "read"
+                dependencies.append(
+                    Tag(
+                        rel_fname=rel_fname,
+                        fname=current_function,
+                        line=[param_name_node.start_point[0] + 1, param_name_node.end_point[0] + 1],
+                        name=var_name,
+                        kind=kind,
+                        category="parameter",
+                        info={"var_type": var_type} if var_type else {}
+                    )
+                )
+            return dependencies
+        # Skip extraction if this node is the callee of a call expression.
+        if (node.parent and 
+            node.parent.type in ("call", "call_expression", "method_invocation") and 
+            node.parent.children and 
+            node == node.parent.children[0]):
+            func_name_node = next((c for c in node.children if c.type == "identifier"), None)
+            if func_name_node:
+                chain = []
+                current = node
+                # Walk through the attribute chain
+                while current and current.type == "attribute":
+                    if len(current.children) >= 2 and current.children[1].type == "identifier":
+                        chain.insert(0, current.children[1].text.decode("utf-8"))
+                    else:
+                        chain.insert(0, current.text.decode("utf-8"))
+                    current = current.children[0] if current.children else None
+                if current and current.type == "identifier":
+                    chain.insert(0, current.text.decode("utf-8"))
+                
+                # Remove adjacent duplicates
+                filtered_chain = []
+                for part in chain:
+                    if not filtered_chain or filtered_chain[-1] != part:
+                        filtered_chain.append(part)
+                # Combine the filtered chain using our helper
+                full_name = self._combine_chain(filtered_chain)
+                dependencies.append(Tag(
+                    rel_fname=rel_fname,
+                    fname=current_function,  # The caller’s function name
+                    line=[node.start_point[0] + 1, node.end_point[0] + 1],
+                    name=full_name,        # The callee name
+                    kind="call",
+                    category="function_call",
+                    info={}
+                ))
+            return dependencies
+        # In a function_definition header skip the function name.
+        # (This is a known limitation since the def node yields the function name as its first identifier.)
+        if node.type == "function_definition" and node.child_count > 0:
+            # Skip first child if it is "def" or the function name.
+            for child in node.children:
+                # Only process children that are not directly the function name from header.
+                # You can improve this by detecting the parameters node explicitly.
+                if child.type not in ("def", "identifier"):
+                    dependencies.extend(
+                        self.extract_variable_attributes(child, rel_fname, current_function, inside_assignment)
+                    )
+            return dependencies
 
+        # Process assignments: treat left-hand identifiers as writes and right-hand as reads.
         if node.type in ("assignment", "augmented_assignment_expression"):
-            # Typically child[0] => left side (writes), child[-1] => right side (reads)
             if len(node.children) >= 2:
                 lhs = node.children[0]
                 rhs = node.children[-1]
@@ -129,46 +207,85 @@ class CodeGraph:
                 dependencies.extend(
                     self.extract_variable_attributes(rhs, rel_fname, current_function, inside_assignment=False)
                 )
+            return dependencies
 
-        elif node.type == "identifier":
+        # Process simple identifiers (but skip if parent is a type annotation)
+        if node.type == "identifier":
+            if node.parent and (node.parent.type == "type" or node.parent.type == "type_annotation" or node.parent.type=="call" or node.parent.type=="call_expression" or node.parent.type=="method_invocation" or (node.parent.type == "tuple" and (node.parent.parent and (node.parent.parent.type == "type_annotation" or node.parent.parent.type == "type")))):
+                return dependencies
             var_name = node.text.decode("utf-8")
             kind = "write" if inside_assignment else "read"
             dependencies.append(
                 Tag(
                     rel_fname=rel_fname,
-                    fname=current_function,  # The enclosing function’s name
+                    fname=current_function,
                     line=[node.start_point[0] + 1, node.end_point[0] + 1],
                     name=var_name,
-                    kind=kind,               # "read" or "write"
-                    category="var_dependency",
+                    kind=kind,
+                    category="var_dependency" if node.parent.type!="parameters" else "parameter",
                     info={}
                 )
             )
+            return dependencies
 
-        elif node.type == "attribute":
-            # e.g. "self.x" or "obj.prop" in Python
-            var_name = node.text.decode("utf-8")
+        # Process attribute nodes by combining the full attribute chain into one name.
+        if node.type == "attribute":
+            chain = []
+            current = node
+            # Walk through the attribute chain
+            while current and current.type == "attribute":
+                if len(current.children) >= 2 and current.children[1].type == "identifier":
+                    chain.insert(0, current.children[1].text.decode("utf-8"))
+                else:
+                    chain.insert(0, current.text.decode("utf-8"))
+                current = current.children[0] if current.children else None
+            if current and current.type == "identifier":
+                chain.insert(0, current.text.decode("utf-8"))
+            
+            # Remove adjacent duplicates
+            filtered_chain = []
+            for part in chain:
+                if not filtered_chain or filtered_chain[-1] != part:
+                    filtered_chain.append(part)
+            # Combine the filtered chain using our helper
+            full_name = self._combine_chain(filtered_chain)
             kind = "write" if inside_assignment else "read"
             dependencies.append(
                 Tag(
                     rel_fname=rel_fname,
-                    fname=current_function,  # The enclosing function’s name
+                    fname=current_function,
                     line=[node.start_point[0] + 1, node.end_point[0] + 1],
-                    name=var_name,
+                    name=full_name,
                     kind=kind,
                     category="var_dependency",
                     info={"is_attribute": True}
                 )
             )
+            return dependencies
 
-        # Recurse further if we're not specifically dividing assignment left/right
-        if node.type not in ("assignment", "augmented_assignment_expression"):
-            for child in node.children:
-                dependencies.extend(
-                    self.extract_variable_attributes(child, rel_fname, current_function, inside_assignment)
-                )
-
+        # Recurse into children for all other node types.
+        for child in node.children:
+            dependencies.extend(
+                self.extract_variable_attributes(child, rel_fname, current_function, inside_assignment)
+            )
         return dependencies
+    
+    def _combine_chain(self, chain):
+        """
+        Given a list of attribute components (in order), combine them while removing
+        duplicate prefixes. For example, if chain is ["board", "board.builder"],
+        then return "board.builder", as the second element already includes the first.
+        """
+        if not chain:
+            return ""
+        result = chain[0]
+        for item in chain[1:]:
+            # If the next item already starts with result + '.', update result to the more detailed name.
+            if item.startswith(result + "."):
+                result = item
+            else:
+                result = result + "." + item
+        return result
 
     def extract_inheritance_tags(self, class_node, file_extension, rel_fname, class_name):
         """
@@ -231,7 +348,65 @@ class CodeGraph:
                     )
         # C has no built-in class inheritance
         return inheritance_tags
+    
+    def extract_global_tags(self, node, rel_fname):
+        """
+        Recursively extract tags (e.g. function calls, assignments, attribute accesses) 
+        from nodes that are not nested inside a function or class definition.
+        These represent global-level expressions.
+        """
+        global_tags = []
+        # If the current node is itself a function or class definition, skip recursing into it.
+        if node.type in [
+            "class", "class_definition", "function", "function_definition",
+            "function_declaration", "class_declaration", "method_declaration"
+        ]:
+            return global_tags
 
+        # Process expected global nodes
+        if node.type in ("call", "call_expression", "method_invocation"):
+            # Extract the called function's name.
+            func_name_node = next((c for c in node.children if c.type == "identifier"), None)
+            if func_name_node:
+                callee_name = func_name_node.text.decode("utf-8")
+                start_line = node.start_point[0] + 1
+                end_line = node.end_point[0] + 1
+                global_tags.append(
+                    Tag(
+                        rel_fname=rel_fname,
+                        fname="global",
+                        line=[start_line, end_line],
+                        name=callee_name,
+                        kind="call",
+                        category="function_call",
+                        info={}
+                    )
+                )
+
+        elif node.type in ("assignment", "augmented_assignment_expression"):
+            # For assignments, process the left-hand side as a write and the right-hand side as a read.
+            if len(node.children) >= 2:
+                lhs = node.children[0]
+                rhs = node.children[-1]
+                # Process LHS as write
+                global_tags.extend(
+                    self.extract_variable_attributes(lhs, rel_fname, current_function="global", inside_assignment=True)
+                )
+                # Process RHS as read
+                global_tags.extend(
+                    self.extract_variable_attributes(rhs, rel_fname, current_function="global", inside_assignment=False)
+                )
+
+        # Recursively process children, but skip children that start a new definition.
+        for child in node.children:
+            # Only traverse into children if the current node didn't already represent a definition.
+            if child.type not in (
+                "class", "class_definition", "function", "function_definition",
+                "function_declaration", "class_declaration", "method_declaration"
+            ):
+                global_tags.extend(self.extract_global_tags(child, rel_fname))
+        return global_tags
+    
     def extract_tags(self, node, rel_fname):
         """
         Recursively extract tags (classes, functions, calls, var_deps, etc.) from a tree-sitter node.
@@ -387,8 +562,9 @@ class CodeGraph:
         tree = self.parse_tree(code, file_extension)
 
         def_tags = self.extract_tags(tree.root_node, rel_fname)
+        global_tags = self.extract_global_tags(tree.root_node, rel_fname)
         import_tags = self.extract_imports(tree.root_node, file_extension, rel_fname)
-        return def_tags + import_tags
+        return def_tags + global_tags + import_tags
 
     def get_code_graph(self, other_files, mentioned_fnames=None):
         """Build a code graph from extracted tags for the given list of file paths."""
@@ -426,11 +602,15 @@ class CodeGraph:
             return False
 
         mod_name = match.group(1) or match.group(2)
-        mod_name = mod_name.split('.')[0]
+        mod_name = mod_name.replace('.', '/')
 
         for fpath in self.all_source_files:
-            base = os.path.splitext(os.path.basename(fpath))[0]
-            if base == mod_name:
+            # Get the file path relative to the repository root and remove the extension.
+            rel_path = os.path.relpath(fpath, self.root)
+            no_ext = os.path.splitext(rel_path)[0]
+            # Check if the relative path ends with the module name,
+            # which handles cases where mod_name contains '/'.
+            if no_ext.endswith(mod_name):
                 return True
         return False
 
@@ -475,6 +655,7 @@ class CodeGraph:
                     "created_at": created_at,
                     "updated_at": updated_at,
                     "dependencies": [],
+                    "import_statements":[],
                     "total_lines": total_lines
                 },
             }
@@ -482,6 +663,38 @@ class CodeGraph:
 
         # 2) Create nodes for classes, functions, variables, etc.
         for tag in tags:
+            if tag.category == "parameter":
+                # Determine the parent function's node key using tag.fname
+                func_key = self._get_func_node_key(tag.rel_fname, tag.fname)
+                param_info = {
+                    "name": tag.name,
+                    "line": tag.line,
+                }
+                # Include type information if available.
+                if isinstance(tag.info, dict) and tag.info.get("var_type"):
+                    param_info["var_type"] = tag.info["var_type"]
+                if G.has_node(func_key):
+                    if "parameters" not in G.nodes[func_key]["metadata"]:
+                        G.nodes[func_key]["metadata"]["parameters"] = []
+                    G.nodes[func_key]["metadata"]["parameters"].append(param_info)
+                else:
+                    # Create the function node if it doesn't exist.
+                    G.add_node(
+                        func_key,
+                        relative_path=tag.rel_fname,
+                        file_name=os.path.basename(tag.rel_fname),
+                        name=tag.fname,
+                        type="function",
+                        line_range=tag.line,
+                        metadata={
+                            "parameters": [param_info],
+                            "parent_class": None,
+                            "calls": [],
+                            "reads": {},
+                            "writes": {},
+                        }
+                    )
+                continue
             # Skip external imports from being nodes
             if tag.category == 'import' and not self.is_local_import(tag.name):
                 continue
@@ -529,15 +742,19 @@ class CodeGraph:
                         "parameters": [],
                         "parent_class": None,
                         "calls": [],
-                        "reads": [],
-                        "writes": [],
+                        "reads": {},
+                        "writes": {},
                     }
                 elif node_type == "variable":
                     is_attr = (isinstance(tag.info, dict) and tag.info.get("is_attribute")) or False
+                    var_type = None
+                    if isinstance(tag.info, dict) and "var_type" in tag.info:
+                        var_type = tag.info["var_type"]
                     node_data["metadata"] = {
                         "is_attribute": is_attr,
-                        "accessed_by": [],
-                        "modified_by": [],
+                        "accessed_by": set(),
+                        "modified_by": set(),
+                        "var_type": var_type
                     }
 
                 G.add_node(node_key, **node_data)
@@ -572,8 +789,28 @@ class CodeGraph:
                 importing_file_node = tag.rel_fname
                 imported_module_string = tag.name
 
-                # Skip external
                 if not self.is_local_import(imported_module_string):
+                    # Create a node for external imports
+                    imported_module_path = self._parse_import_path(imported_module_string)
+                    external_key = f"external::{imported_module_path}"
+
+                    if not G.has_node(external_key):
+                        G.add_node(
+                            external_key,
+                            relative_path=None,
+                            file_name=imported_module_path,
+                            name=imported_module_path,
+                            type="external_lib",  # Mark as external
+                            line_range=tag.line,
+                            metadata={}
+                        )
+                    G.add_edge(importing_file_node, external_key, label='imports_external')
+                    G.nodes[importing_file_node]["metadata"]["dependencies"].append(external_key)
+                    G.nodes[importing_file_node]["metadata"]["import_statements"].append({
+                        "import_text": imported_module_string,
+                        "line_range": tag.line
+                    })
+                    # Skip further local-file logic
                     continue
 
                 # For C #include "...":
@@ -587,21 +824,38 @@ class CodeGraph:
                                 if base == local_header_basename:
                                     G.add_edge(importing_file_node, f, label='imports')
                                     G.nodes[importing_file_node]["metadata"]["dependencies"].append(f)
+                                    G.nodes[importing_file_node]["metadata"]["import_statements"].append({
+                                        "import_text": imported_module_string,
+                                        "line_range": tag.line
+                                    })
                 else:
                     # Python/JS/Java
-                    base_match = re.match(
-                        r'(?:from\s+([\w\.]+)\s+import)|(?:import\s+([\w\.]+))',
-                        imported_module_string
-                    )
-                    if base_match:
-                        mod_name = base_match.group(1) or base_match.group(2)
-                        mod_name = mod_name.split('.')[0]
+                    # Use the helper to parse the import string into a module path
+                    imported_module_path = self._parse_import_path(imported_module_string)
+                    # For Python modules, convert dot notation to a relative file path
+                    possible_rel_path = imported_module_path.replace('.', os.sep) + ".py"
+                    
+                    # If the computed file exists in our graph's file nodes, link them
+                    if possible_rel_path in G.nodes and G.nodes[possible_rel_path].get('type') == 'file':
+                        G.add_edge(importing_file_node, possible_rel_path, label='imports')
+                        G.nodes[importing_file_node]["metadata"]["dependencies"].append(possible_rel_path)
+                        G.nodes[importing_file_node]["metadata"]["import_statements"].append({
+                            "import_text": imported_module_string,
+                            "line_range": tag.line
+                        })
+                    else:
+                        # Fallback: try matching by base file name if the above direct mapping fails
+                        imported_base = os.path.splitext(os.path.basename(imported_module_path))[0]
                         for f in G.nodes:
                             if G.nodes[f].get('type') == 'file':
-                                base = os.path.splitext(os.path.basename(f))[0]
-                                if base == mod_name:
+                                file_base = os.path.splitext(os.path.basename(f))[0]
+                                if file_base == imported_base:
                                     G.add_edge(importing_file_node, f, label='imports')
                                     G.nodes[importing_file_node]["metadata"]["dependencies"].append(f)
+                                    G.nodes[importing_file_node]["metadata"]["import_statements"].append({
+                                        "import_text": imported_module_string,
+                                        "line_range": tag.line
+                                    })
 
         # 6) function->function edges from calls
         for tag in tags:
@@ -628,8 +882,8 @@ class CodeGraph:
                             "parameters": [],
                             "parent_class": None,
                             "calls": [],
-                            "reads": [],
-                            "writes": [],
+                            "reads": {},
+                            "writes": {},
                         }
                     )
                 # Ensure we have a node for callee
@@ -645,8 +899,8 @@ class CodeGraph:
                             "parameters": [],
                             "parent_class": None,
                             "calls": [],
-                            "reads": [],
-                            "writes": [],
+                            "reads": {},
+                            "writes": {},
                         }
                     )
 
@@ -708,7 +962,7 @@ class CodeGraph:
                     continue
 
                 func_key = self._get_func_node_key(tag.rel_fname, func_name)
-                var_key = self._get_var_node_key(tag.rel_fname, var_name)
+                var_key = self._get_var_node_key(tag.rel_fname, var_name, func_name)
 
 
                 if not G.has_node(func_key):
@@ -723,8 +977,8 @@ class CodeGraph:
                             "parameters": [],
                             "parent_class": None,
                             "calls": [],
-                            "reads": [],
-                            "writes": [],
+                            "reads": {},
+                            "writes": {},
                         }
                     )
                 if not G.has_node(var_key):
@@ -738,8 +992,8 @@ class CodeGraph:
                         line_range=[tag.line[0], tag.line[1]],
                         metadata={
                             "is_attribute": is_attr,
-                            "accessed_by": [],
-                            "modified_by": [],
+                            "accessed_by": set(),
+                            "modified_by": set(),
                         }
                     )
 
@@ -748,17 +1002,19 @@ class CodeGraph:
 
                 # Update function's reads/writes
                 if label == 'reads':
+                    # Instead of storing just var_key, store var_key plus line info
                     if var_key not in G.nodes[func_key]["metadata"]["reads"]:
-                        G.nodes[func_key]["metadata"]["reads"].append(var_key)
+                        G.nodes[func_key]["metadata"]["reads"][var_key] = set()
+                    G.nodes[func_key]["metadata"]["reads"][var_key].add(tag.line[0])
+                    # Update variable usage
+                    G.nodes[var_key]["metadata"]["accessed_by"].add(func_key)
                 else:
+                    # Instead of storing just var_key, store var_key plus line 
                     if var_key not in G.nodes[func_key]["metadata"]["writes"]:
-                        G.nodes[func_key]["metadata"]["writes"].append(var_key)
-
-                # Update variable's usage
-                if label == 'reads':
-                    G.nodes[var_key]["metadata"]["accessed_by"].append(func_key)
-                else:
-                    G.nodes[var_key]["metadata"]["modified_by"].append(func_key)
+                        G.nodes[func_key]["metadata"]["writes"][var_key] = set()
+                    G.nodes[func_key]["metadata"]["writes"][var_key].add(tag.line[0])
+                    # Update variable usage
+                    G.nodes[var_key]["metadata"]["modified_by"].add(func_key)
 
         return G
 
@@ -767,29 +1023,47 @@ class CodeGraph:
         if tag.kind == "def" and tag.category == "class":
             return f"{tag.rel_fname}::class::{tag.name}"
         if tag.kind in ["def", "method"] and tag.category == "function":
-            return self._get_func_node_key(tag.rel_fname, tag.name)
+            return self._get_func_node_key(tag.rel_fname, tag.fname)
         if tag.kind in ["read", "write"]:
-            return self._get_var_node_key(tag.rel_fname, tag.name)
+            return self._get_var_node_key(tag.rel_fname, tag.name, parent_identifier=tag.fname)
         return f"{tag.rel_fname}::{tag.category}::{tag.name}"
 
     def _get_func_node_key(self, rel_fname, func_name):
         return f"{rel_fname}::function::{func_name}"
 
-    def _get_var_node_key(self, rel_fname, var_name):
+    def _get_var_node_key(self, rel_fname, var_name, parent_identifier=None):
+        """
+        Return a unique key for a variable node.
+        If a parent_identifier is given (like a function name or class name),
+        use the format: "file::parent_identifier|var::var_name" 
+        otherwise: "file::var::var_name"
+        """
+        if parent_identifier:
+            return f"{rel_fname}::{parent_identifier}|var::{var_name}"
         return f"{rel_fname}::var::{var_name}"
 
     def _get_class_node_key(self, rel_fname, cls_name):
         return f"{rel_fname}::class::{cls_name}"
 
     def _parse_import_path(self, import_string):
+        """
+        Extract the module path from an import statement. For example:
+        "from Pieces.Bishop import Bishop" -> "Pieces.Bishop".
+        """
+        # If it’s a C-style #include, handle separately
         if import_string.startswith("#include"):
             match = re.search(r'#include\s+"([^"]+)"', import_string)
             if match:
-                return match.group(1)
-            return import_string
+                return match.group(1)  # e.g. "someheader.h"
+            return import_string  # Fallback
+
+        # For Python: match either 'from X.Y import ...' or 'import X.Y'
+        # Captures "X.Y" as group(1) if 'from X.Y import ...', or group(2) if 'import X.Y'
         match = re.match(r'(?:from\s+([\w\.]+)\s+import)|(?:import\s+([\w\.]+))', import_string)
         if match:
-            return match.group(1) or match.group(2)
+            module_path = match.group(1) or match.group(2)
+            return module_path
+        
         return import_string
 
     def get_rel_fname(self, fname):

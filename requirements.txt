@@ -8,3 +8,6 @@ datasets
 openai==1.42.0
 tiktoken==0.7.0
 libcst==1.4.0
+matplotlib
+plotly
+scipy
