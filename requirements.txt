@@ -3,11 +3,11 @@ tree-sitter-languages==1.10.2
 grep-ast==0.3.2
 networkx==3.2.1
 # pygments==2.18.0
-tqdm
+tqdm==4.67.1
 # datasets
 # openai==1.42.0
 # tiktoken==0.7.0
 libcst==1.4.0
 # matplotlib
 # plotly
-scipy
+scipy==1.15.2
