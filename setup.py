@@ -18,4 +18,7 @@ setup(
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",
     ],
+    package_data={
+        "repograph": ["*.py", "build/my-languages.so"],
+    }
 )
