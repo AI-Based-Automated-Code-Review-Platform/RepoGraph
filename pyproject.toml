@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "RepoGraph"
+version = "0.1.0"
+description = "A package for analyzing and visualizing repository dependency graphs."
+authors = ["AIBACRP <your.email@example.com>"]
+readme = "README.md"
+license = "MIT"
+packages = [
+    { include = "repograph" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.6"
+tree-sitter = "0.21.3"
+tree-sitter-languages = "1.10.2"
+grep-ast = "0.3.2"
+networkx = "3.2.1"
+tqdm = "4.67.1"
+libcst = "1.4.0"
+scipy = "1.15.2"
+
+[[tool.poetry.include]]
+# This will copy repograph/build/my-languages.so into the package.
+path = "repograph/build/my-languages.so"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
