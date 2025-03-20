@@ -1,11 +1,15 @@
 import os
 from tree_sitter import Language, Parser
 
+# Get the absolute path to two levels up (project root), then join to the build directory.
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SO_PATH = os.path.join(BASE_DIR, "build", "my-languages.so")
+
 # Load the tree-sitter Python, JavaScript, Java, and C parsers
-PY_LANGUAGE = Language("build/my-languages.so", "python")
-JS_LANGUAGE = Language("build/my-languages.so", "javascript")
-JAVA_LANGUAGE = Language("build/my-languages.so", "java")
-C_LANGUAGE = Language("build/my-languages.so", "c")
+PY_LANGUAGE = Language(SO_PATH, 'python')
+JS_LANGUAGE = Language(SO_PATH, 'javascript')
+JAVA_LANGUAGE = Language(SO_PATH, 'java')
+C_LANGUAGE = Language(SO_PATH, "c")
 
 parser = Parser()
 
